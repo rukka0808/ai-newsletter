@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 
 import requests
 from bs4 import BeautifulSoup
@@ -21,6 +22,10 @@ import google.generativeai as genai
 KST = timezone(timedelta(hours=9))
 TODAY = datetime.now(KST)
 TODAY_STR = TODAY.strftime('%Y년 %m월 %d일 (%a)')
+NOW_UTC = datetime.now(timezone.utc)
+
+# 🆕 "오늘 기사" 기준: 최근 24시간 이내만 허용
+FRESHNESS_HOURS = 24
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -33,10 +38,58 @@ HEADERS = {
 
 
 # =========================================================
-# 1. 🇰🇷 국내 뉴스 - Google News RSS (한국 언론사 필터)
+# 🆕 공통 유틸: pubDate 파싱 + 신선도 필터 + 중복 제거
+# =========================================================
+def _parse_pubdate(date_str):
+    """RFC 822 형식의 pubDate → datetime (UTC). 실패 시 None"""
+    if not date_str:
+        return None
+    try:
+        dt = parsedate_to_datetime(date_str.strip())
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _is_fresh(pub_dt, hours=FRESHNESS_HOURS):
+    """발행시각이 최근 N시간 이내인가?"""
+    if pub_dt is None:
+        return False  # pubDate 없으면 안전하게 제외
+    return (NOW_UTC - pub_dt) <= timedelta(hours=hours)
+
+
+def _normalize_title(title):
+    """중복 검사용: 특수문자/공백 제거 + 소문자"""
+    if not title:
+        return ""
+    t = re.sub(r"[\s\W_]+", "", title.lower())
+    return t[:60]  # 앞 60자만으로 동일성 판단
+
+
+def _dedupe_and_filter(articles, hours=FRESHNESS_HOURS):
+    """① 최근 N시간 이내 + ② 제목 기준 중복 제거"""
+    seen = set()
+    result = []
+    for a in articles:
+        if not _is_fresh(a.get("_pub_dt"), hours):
+            continue
+        norm = _normalize_title(a.get("original_title") or a.get("title"))
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        # 내부 키 삭제
+        a.pop("_pub_dt", None)
+        result.append(a)
+    return result
+
+
+# =========================================================
+# 1. 🇰🇷 국내 뉴스 - Google News RSS (날짜순 + 신선도 필터)
 # =========================================================
 def fetch_domestic_news(queries_dict, per_query=4):
-    print("🇰🇷 [STEP 1] 국내 뉴스 수집 중 (Google News RSS)...")
+    print(f"🇰🇷 [STEP 1] 국내 뉴스 수집 중 (최근 {FRESHNESS_HOURS}시간 필터)...")
     results = {}
     site_filter = (
         "(site:hankyung.com OR site:mk.co.kr OR site:yna.co.kr "
@@ -46,21 +99,23 @@ def fetch_domestic_news(queries_dict, per_query=4):
     )
 
     for key, query in queries_dict.items():
+        # ⭐ when:1d 유지 + 정렬은 RSS 기본(시간순에 가까움) + 후처리로 한 번 더 필터
         full_q = f"{query} {site_filter} when:1d"
         encoded = urllib.parse.quote(full_q)
         url = f"https://news.google.com/rss/search?q={encoded}&hl=ko&gl=KR&ceid=KR:ko"
 
-        articles = []
+        raw_articles = []
         try:
             r = requests.get(url, headers=HEADERS, timeout=15)
             r.raise_for_status()
             root = ET.fromstring(r.content)
-            items = root.findall(".//item")[:per_query]
 
-            for item in items:
+            # ⭐ 후보를 넉넉히 가져와서 (per_query * 4) 필터링 후 상위 N개 선택
+            for item in root.findall(".//item")[:per_query * 4]:
                 title_raw = (item.findtext("title") or "").strip()
                 link = (item.findtext("link") or "#").strip()
                 desc_raw = (item.findtext("description") or "").strip()
+                pub_str = (item.findtext("pubDate") or "").strip()
                 source_el = item.find("source")
                 press = source_el.text.strip() if source_el is not None and source_el.text else "국내경제지"
 
@@ -70,23 +125,47 @@ def fetch_domestic_news(queries_dict, per_query=4):
                     title = title_raw
 
                 summary = BeautifulSoup(desc_raw, "html.parser").get_text(strip=True)[:250]
-                articles.append({
-                    "title": title, "link": link,
-                    "press": press, "summary": summary or title,
+
+                raw_articles.append({
+                    "title": title,
+                    "original_title": title,
+                    "link": link,
+                    "press": press,
+                    "summary": summary or title,
+                    "_pub_dt": _parse_pubdate(pub_str),
                 })
-            print(f"  ✅ [{key}] {len(articles)}건 수집")
+
+            # ⭐ 신선도 + 중복 제거
+            filtered = _dedupe_and_filter(raw_articles)
+            # 최신순 정렬 (이미 정렬되어 있지만 안전하게)
+            articles = filtered[:per_query]
+            results[key] = articles
+            print(f"  ✅ [{key}] 후보 {len(raw_articles)}건 → 필터 후 {len(articles)}건")
+
         except Exception as e:
             print(f"  ❌ [{key}] 수집 실패: {e}")
+            results[key] = []
 
-        results[key] = articles
         time.sleep(0.4)
+
+    # ⭐ 키 전체에 걸쳐 중복 제거 (다른 검색어에서 같은 기사가 잡힐 수 있음)
+    global_seen = set()
+    for key in results:
+        deduped = []
+        for a in results[key]:
+            norm = _normalize_title(a["title"])
+            if norm in global_seen:
+                continue
+            global_seen.add(norm)
+            deduped.append(a)
+        results[key] = deduped
     return results
 
 
 # =========================================================
-# 2. 🌎 해외 뉴스 (DeepL 번역 통합)
+# 2. 🌎 해외 뉴스 (DeepL + 신선도 필터)
 # =========================================================
-def _translate_article(translator, title, desc, link, press):
+def _translate_article(translator, title, desc, link, press, pub_dt):
     if translator and title:
         try:
             title_ko = translator.translate_text(title, target_lang="KO").text
@@ -96,74 +175,107 @@ def _translate_article(translator, title, desc, link, press):
             title_ko, desc_ko = title, desc
     else:
         title_ko, desc_ko = title, desc
-    return {"title": title_ko, "link": link, "press": press,
-            "summary": desc_ko, "original_title": title}
+    return {
+        "title": title_ko, "link": link, "press": press,
+        "summary": desc_ko, "original_title": title,
+        "_pub_dt": pub_dt,
+    }
 
 
 def fetch_cnbc_news(translator, limit=3):
-    print("🌎 [STEP 2-1] CNBC Markets RSS 수집 중...")
+    print(f"🌎 [STEP 2-1] CNBC Markets RSS (최근 {FRESHNESS_HOURS}h 필터)...")
     url = "https://search.cnbc.com/rs/search/combinedcms/view.xml?profile=120000000&id=10000664"
-    articles = []
+    raw_articles = []
     try:
         r = requests.get(url, timeout=10, headers=HEADERS)
         root = ET.fromstring(r.content)
-        for item in root.findall(".//item")[:limit]:
+        # ⭐ 후보 넉넉히
+        for item in root.findall(".//item")[:limit * 4]:
             raw_title = (item.findtext("title") or "").strip()
             link = (item.findtext("link") or "#").strip()
             raw_desc = (item.findtext("description") or "").strip()
+            pub_str = (item.findtext("pubDate") or "").strip()
             clean_desc = BeautifulSoup(raw_desc, "html.parser").get_text(strip=True)
-            articles.append(_translate_article(translator, raw_title, clean_desc, link, "CNBC"))
+            pub_dt = _parse_pubdate(pub_str)
+            # ⭐ 번역 비용 절약: 신선한 것만 번역
+            if not _is_fresh(pub_dt):
+                continue
+            raw_articles.append(
+                _translate_article(translator, raw_title, clean_desc, link, "CNBC", pub_dt)
+            )
+        articles = _dedupe_and_filter(raw_articles)[:limit]
+        print(f"  ✅ CNBC: 필터 후 {len(articles)}건")
+        return articles
     except Exception as e:
         print(f"  ❌ CNBC 수집 실패: {e}")
-    return articles
+        return []
 
 
 def fetch_investing_news(translator, limit=2):
-    print("🌎 [STEP 2-2] Investing.com 채권/외환 RSS 수집 중...")
+    print(f"🌎 [STEP 2-2] Investing.com 채권/외환 RSS (최근 {FRESHNESS_HOURS}h 필터)...")
     feeds = {
         "Bond": "https://www.investing.com/rss/news_25.rss",
         "Forex": "https://www.investing.com/rss/news_1.rss",
         "Economy": "https://www.investing.com/rss/news_14.rss",
     }
-    articles = []
+    all_articles = []
     for cat, url in feeds.items():
+        raw_articles = []
         try:
             r = requests.get(url, timeout=10, headers=HEADERS)
             root = ET.fromstring(r.content)
-            for item in root.findall(".//item")[:limit]:
+            for item in root.findall(".//item")[:limit * 5]:
                 raw_title = (item.findtext("title") or "").strip()
                 link = (item.findtext("link") or "#").strip()
                 raw_desc = (item.findtext("description") or "").strip()
+                pub_str = (item.findtext("pubDate") or "").strip()
                 clean_desc = BeautifulSoup(raw_desc, "html.parser").get_text(strip=True)[:400]
-                articles.append(_translate_article(translator, raw_title, clean_desc, link, f"Investing-{cat}"))
+                pub_dt = _parse_pubdate(pub_str)
+                if not _is_fresh(pub_dt):
+                    continue
+                raw_articles.append(
+                    _translate_article(translator, raw_title, clean_desc, link, f"Investing-{cat}", pub_dt)
+                )
+            cat_articles = _dedupe_and_filter(raw_articles)[:limit]
+            print(f"  ✅ Investing-{cat}: 필터 후 {len(cat_articles)}건")
+            all_articles.extend(cat_articles)
         except Exception as e:
             print(f"  ❌ Investing [{cat}] 실패: {e}")
         time.sleep(0.3)
-    return articles
+    return all_articles
 
 
 def fetch_reuters_markets(translator, limit=3):
-    print("🌎 [STEP 2-3] Reuters Markets (Google News 우회) 수집 중...")
+    print(f"🌎 [STEP 2-3] Reuters Markets (최근 {FRESHNESS_HOURS}h 필터)...")
     url = ("https://news.google.com/rss/search?"
            "q=site:reuters.com+(markets+OR+bonds+OR+fed+OR+treasury)+when:1d"
            "&hl=en-US&gl=US&ceid=US:en")
-    articles = []
+    raw_articles = []
     try:
         r = requests.get(url, timeout=10, headers=HEADERS)
         root = ET.fromstring(r.content)
-        for item in root.findall(".//item")[:limit]:
+        for item in root.findall(".//item")[:limit * 4]:
             raw_title = (item.findtext("title") or "").strip()
             link = (item.findtext("link") or "#").strip()
             raw_desc = (item.findtext("description") or "").strip()
+            pub_str = (item.findtext("pubDate") or "").strip()
             clean_desc = BeautifulSoup(raw_desc, "html.parser").get_text(strip=True)[:400]
-            articles.append(_translate_article(translator, raw_title, clean_desc, link, "Reuters"))
+            pub_dt = _parse_pubdate(pub_str)
+            if not _is_fresh(pub_dt):
+                continue
+            raw_articles.append(
+                _translate_article(translator, raw_title, clean_desc, link, "Reuters", pub_dt)
+            )
+        articles = _dedupe_and_filter(raw_articles)[:limit]
+        print(f"  ✅ Reuters: 필터 후 {len(articles)}건")
+        return articles
     except Exception as e:
         print(f"  ❌ Reuters 수집 실패: {e}")
-    return articles
+        return []
 
 
 # =========================================================
-# 3. 📈 시장 지표 - 네이버 증권 통합
+# 3. 📈 시장 지표 - 네이버 증권 통합 (변경 없음)
 # =========================================================
 def fetch_market_indicators():
     print("📈 [STEP 3] 네이버 증권 시장 지표 수집 중...")
@@ -178,11 +290,9 @@ def fetch_market_indicators():
         name_map = {"KOSPI": "KOSPI", "KOSDAQ": "KOSDAQ", "KPI200": "KOSPI200"}
         for row in data["result"]["areas"][0]["datas"]:
             code = row["cd"]
-            # nv/cv는 100배로 전송됨
             price = row["nv"] / 100
             change = row["cv"] / 100
             change_pct = row["cr"]
-            # rf: 1(상한가) 2(상승) 3(보합+) 4(보합-) 5(하락)
             sign = -1 if row["rf"] in ("4", "5") else 1
             indicators[name_map.get(code, code)] = {
                 "price": price,
@@ -216,7 +326,7 @@ def fetch_market_indicators():
         time.sleep(0.2)
     print(f"  ✅ 환율 수집 완료")
 
-    # ③ 금 시세
+    # ③ 금
     try:
         url = "https://api.stock.naver.com/marketindex/metals/M04020000"
         r = requests.get(url, headers=HEADERS, timeout=10)
@@ -258,9 +368,7 @@ def fetch_market_indicators():
                 if pct < 0 and change > 0:
                     change = -change
                 indicators[name] = {
-                    "price": price,
-                    "change": change,
-                    "change_pct": pct,
+                    "price": price, "change": change, "change_pct": pct,
                 }
             else:
                 print(f"  ⚠️ 해외 지수 [{name}] 정규식 매치 실패")
@@ -310,13 +418,14 @@ def generate_ai_briefing(global_news, domestic_news, indicators):
 ## 📊 오늘의 시장 지표
 {indicators_text}
 
-## 🌎 글로벌 뉴스 (밤사이 해외 시장)
+## 🌎 글로벌 뉴스 (밤사이 해외 시장, 최근 24시간 이내)
 {fmt(global_news)}
 
-## 🇰🇷 국내 뉴스
+## 🇰🇷 국내 뉴스 (최근 24시간 이내)
 {fmt(domestic_flat)}
 
 ---
+**반드시 위 뉴스와 지표에 명시된 사실에 근거해서만 작성**하세요. 일반론·과거 사례 금지.
 반드시 아래 JSON 스키마로만, 다른 텍스트 없이 출력하세요. markdown 코드블록 금지.
 
 {{
@@ -385,7 +494,6 @@ def render_html(briefing, global_news, domestic_news, indicators):
         summary = "AI 요약 생성에 실패했습니다. 아래 원문 기사를 참고하세요."
         key_points, actions, watch = [], [], ""
 
-    # 시장 지표 테이블
     ind_rows = ""
     for name, v in indicators.items():
         if v.get("price") is None:
@@ -401,7 +509,6 @@ def render_html(briefing, global_news, domestic_news, indicators):
         </tr>
         """
 
-    # 핵심 포인트 카드
     kp_html = ""
     for kp in key_points:
         kp_html += f"""
@@ -411,7 +518,6 @@ def render_html(briefing, global_news, domestic_news, indicators):
         </div>
         """
 
-    # 액션 포인트
     action_html = ""
     for i, a in enumerate(actions, 1):
         action_html += f"""
@@ -421,7 +527,6 @@ def render_html(briefing, global_news, domestic_news, indicators):
         </div>
         """
 
-    # 뉴스 섹션 빌더
     def build_news_section(title, icon, theme, articles, max_n=6):
         items = ""
         for art in articles[:max_n]:
@@ -497,13 +602,13 @@ def render_html(briefing, global_news, domestic_news, indicators):
       ''' if watch else ''}
 
       <div style="padding:0 25px;">
-        {build_news_section("국내 경제 / 채권 / 환율 뉴스", "🇰🇷", "#b91c1c", domestic_all, 6)}
-        {build_news_section("글로벌 시장 뉴스", "🌎", "#1e40af", global_news, 6)}
+        {build_news_section("국내 경제 / 채권 / 환율 뉴스", "🇰🇷", "#b91c1c", domestic_all, 8)}
+        {build_news_section("글로벌 시장 뉴스", "🌎", "#1e40af", global_news, 8)}
       </div>
 
       <div style="margin-top:30px;padding:20px;background:#0f172a;color:#94a3b8;text-align:center;font-size:11px;line-height:1.6;">
         본 리포트는 Gemini AI 분석 + DeepL 번역 + 멀티소스 크롤링으로 자동 생성됩니다.<br>
-        투자 결정의 최종 책임은 투자자 본인에게 있습니다.<br>
+        모든 뉴스는 최근 {FRESHNESS_HOURS}시간 이내 발행분이며, 투자 결정의 최종 책임은 투자자 본인에게 있습니다.<br>
         <span style="color:#475569;">Powered by GitHub Actions × Python × Gemini × DeepL × Naver Finance</span>
       </div>
     </div>
@@ -544,14 +649,14 @@ def send_email(html_content):
 # 7. 🚀 메인 파이프라인
 # =========================================================
 if __name__ == "__main__":
-    print(f"🚀 일일 투자 브리핑 파이프라인 시작 ({TODAY_STR})\n")
+    print(f"🚀 일일 투자 브리핑 파이프라인 시작 ({TODAY_STR})")
+    print(f"⏰ 현재 UTC: {NOW_UTC.strftime('%Y-%m-%d %H:%M:%S')} / 신선도 기준: {FRESHNESS_HOURS}h\n")
 
     deepl_key = os.environ.get("DEEPL_API_KEY")
     translator = deepl.Translator(deepl_key) if deepl_key else None
     if not translator:
         print("⚠️ DEEPL_API_KEY 없음 - 해외 뉴스는 영문으로 발송됩니다.")
 
-    # 1) 국내 뉴스
     domestic_queries = {
         "korea_bond_rate": "국고채 금리 채권시장",
         "korea_fx":        "원달러 환율 외환시장",
@@ -560,19 +665,14 @@ if __name__ == "__main__":
     }
     domestic_news = fetch_domestic_news(domestic_queries, per_query=4)
 
-    # 2) 해외 뉴스
     global_news = []
     global_news += fetch_cnbc_news(translator, limit=3)
     global_news += fetch_investing_news(translator, limit=2)
     global_news += fetch_reuters_markets(translator, limit=3)
 
-    # 3) 시장 지표
     indicators = fetch_market_indicators()
-
-    # 4) Gemini 분석
     briefing = generate_ai_briefing(global_news, domestic_news, indicators)
 
-    # 5) 디버그 요약
     print("\n========== 수집 결과 요약 ==========")
     print(f"국내 뉴스: {sum(len(v) for v in domestic_news.values())}건")
     for k, v in domestic_news.items():
@@ -582,8 +682,6 @@ if __name__ == "__main__":
     print(f"AI 브리핑: {'✅ 생성됨' if briefing else '❌ 실패'}")
     print("====================================\n")
 
-    # 6) HTML 렌더 & 발송
     html = render_html(briefing, global_news, domestic_news, indicators)
     send_email(html)
-
     print("🎉 파이프라인 완료!")
