@@ -452,19 +452,23 @@ def render_html(briefing, global_news, domestic_news, indicators):
         key_points, actions, watch = [], [], ""
 
     # ---- 시장 지표 표 ----
-    ind_rows = ""
-    for name, v in indicators.items():
-        if v.get('price') is None:
-            continue
-        color = "#dc2626" if (v.get('change_pct') or 0) > 0 else "#2563eb"
-        arrow = "▲" if (v.get('change_pct') or 0) > 0 else "▼"
-        ind_rows += f"""
-        <tr>
-          <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#334155;font-weight:600;">{name}</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;text-align:right;color:#0f172a;font-weight:700;">{v['price']:,.2f}</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;text-align:right;color:{color};font-weight:700;">{arrow} {abs(v['change_pct'] or 0):.2f}%</td>
-        </tr>
-        """
+# render_html() 내부, ind_rows 생성 부분만 교체
+ind_rows = ""
+for name, v in indicators.items():
+    if v.get('price') is None:
+        continue
+    pct = v.get('change_pct') or 0
+    color = "#dc2626" if pct > 0 else ("#2563eb" if pct < 0 else "#64748b")
+    arrow = "▲" if pct > 0 else ("▼" if pct < 0 else "▬")
+    # 가격이 1000 이상이면 콤마 + 소수 2자리, 작으면 4자리
+    price_fmt = f"{v['price']:,.2f}" if v['price'] >= 100 else f"{v['price']:,.4f}"
+    ind_rows += f"""
+    <tr>
+      <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#334155;font-weight:600;">{name}</td>
+      <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;text-align:right;color:#0f172a;font-weight:700;">{price_fmt}</td>
+      <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;text-align:right;color:{color};font-weight:700;">{arrow} {abs(pct):.2f}%</td>
+    </tr>
+    """
 
     # ---- 핵심 포인트 카드 ----
     kp_html = ""
