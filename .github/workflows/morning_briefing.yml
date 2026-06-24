@@ -2,12 +2,14 @@ name: Daily Market & AI Briefing
 
 on:
   schedule:
-    - cron: '0 22 * * *' # 한국 시간 아침 7시에 실행
+    # UTC 22:00 = KST 07:00 (월~금)
+    - cron: '0 22 * * 0-4'   # 일~목 22시 UTC = 월~금 07시 KST
   workflow_dispatch:
 
 jobs:
   analyze-and-email:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: 저장소 코드 가져오기
@@ -16,12 +18,13 @@ jobs:
       - name: 파이썬 환경 세팅
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: 필요한 파이썬 패키지 설치
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 pandas arxiv deepl
+          pip install -r requirements.txt
 
       - name: 브리핑 스크립트 실행
         env:
@@ -29,4 +32,5 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
           DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python send_briefing.py
