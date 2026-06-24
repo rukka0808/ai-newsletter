@@ -30,51 +30,62 @@ HEADERS = {
 
 
 # =========================================================
-# 1. 🇰🇷 국내 뉴스 - 네이버 뉴스 (당일자, 다중 키워드)
+# 1. 🇰🇷 국내 뉴스 - Google News RSS (한국 언론사 필터)
+#    네이버 HTML 구조 변경으로 인한 안정적 대체
 # =========================================================
-def fetch_naver_news(queries_dict, per_query=3):
+def fetch_domestic_news(queries_dict, per_query=4):
     """
-    pd=4 → 1일 이내(당일자 위주)
-    sort=1 → 최신순
+    Google News RSS를 통해 한국 주요 경제지 기사만 필터링.
+    when:1d → 최근 24시간 이내 (당일자 위주)
+    hl=ko / gl=KR / ceid=KR:ko → 한국어 한국 결과
     """
-    print("🇰🇷 [STEP 1] 네이버 뉴스 수집 중...")
+    print("🇰🇷 [STEP 1] 국내 뉴스 수집 중 (Google News RSS)...")
     results = {}
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    # 한국 주요 경제/금융 매체로 도메인 제한
+    site_filter = "(site:hankyung.com OR site:mk.co.kr OR site:yna.co.kr OR site:edaily.co.kr OR site:newsis.com OR site:fnnews.com OR site:sedaily.com OR site:chosun.com OR site:joongang.co.kr OR site:mt.co.kr)"
 
     for key, query in queries_dict.items():
-        encoded_query = urllib.parse.quote(query)
-        url = (
-            f"https://search.naver.com/search.naver?where=news"
-            f"&query={encoded_query}&sm=tab_opt&pd=4&sort=1"
-        )
+        full_q = f'{query} {site_filter} when:1d'
+        encoded = urllib.parse.quote(full_q)
+        url = f"https://news.google.com/rss/search?q={encoded}&hl=ko&gl=KR&ceid=KR:ko"
+
         articles = []
         try:
-            res = session.get(url, timeout=10)
-            res.raise_for_status()
-            soup = BeautifulSoup(res.text, 'html.parser')
-            news_wraps = soup.select('.news_wrap')[:per_query]
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            r.raise_for_status()
+            root = ET.fromstring(r.content)
+            items = root.findall('.//item')[:per_query]
 
-            for wrap in news_wraps:
-                title_a = wrap.select_one('.news_tit')
-                if not title_a:
-                    continue
-                title = title_a.get_text(strip=True)
-                link = title_a.get('href', '#')
-                press_a = wrap.select_one('.info_press')
-                press = (press_a.get_text(strip=True).replace("언론사 선정", "")
-                         if press_a else "국내경제지")
-                dsc_div = wrap.select_one('.news_dsc')
-                summary = dsc_div.get_text(strip=True) if dsc_div else ""
+            for item in items:
+                title_raw = (item.findtext('title') or "").strip()
+                link = (item.findtext('link') or "#").strip()
+                desc_raw = (item.findtext('description') or "").strip()
+                source_el = item.find('source')
+                press = source_el.text.strip() if source_el is not None and source_el.text else "국내경제지"
+
+                # title: "기사제목 - 한국경제" 형식이므로 매체명 분리
+                if " - " in title_raw:
+                    title = title_raw.rsplit(" - ", 1)[0]
+                else:
+                    title = title_raw
+
+                # description은 HTML 태그를 포함하므로 정리
+                summary = BeautifulSoup(desc_raw, 'html.parser').get_text(strip=True)
+                # "기사1제목 매체1 기사2제목 매체2..." 형태로 묶이는 것 방지: 첫 250자만
+                summary = summary[:250]
+
                 articles.append({
-                    "title": title, "link": link,
-                    "press": press, "summary": summary
+                    "title": title,
+                    "link": link,
+                    "press": press,
+                    "summary": summary or title,
                 })
+            print(f"  ✅ [{key}] {len(articles)}건 수집")
         except Exception as e:
-            print(f"  ❌ 네이버 [{query}] 수집 실패: {e}")
+            print(f"  ❌ [{key}] 수집 실패: {e}")
 
         results[key] = articles
-        time.sleep(0.5)  # 과다요청 방지
+        time.sleep(0.4)
     return results
 
 
@@ -213,7 +224,7 @@ def fetch_market_indicators():
 
 
 # =========================================================
-# 4. 🤖 Gemini AI - 핵심 시황 요약 + 카드뉴스 생성
+# 4. 🤖 Gemini AI - 핵심 시황 요약 + 카드뉴스 생성 (안정화 버전)
 # =========================================================
 def generate_ai_briefing(global_news, domestic_news, indicators):
     print("🤖 [STEP 4] Gemini AI 핵심 시황 분석 중...")
@@ -223,23 +234,33 @@ def generate_ai_briefing(global_news, domestic_news, indicators):
         return None
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-2.0-flash')
 
-    # 프롬프트용 데이터 정제
+    # ✅ 안정적인 모델 우선순위 (앞에서부터 시도)
+    model_candidates = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest",
+    ]
+
     def fmt(arts):
-        return "\n".join([f"- [{a['press']}] {a['title']} :: {a['summary'][:200]}" for a in arts])
+        if not arts:
+            return "(수집된 기사 없음)"
+        return "\n".join([
+            f"- [{a.get('press','')}] {a.get('title','')} :: {(a.get('summary') or '')[:200]}"
+            for a in arts
+        ])
 
     indicators_text = "\n".join([
-        f"- {k}: {v['price']:.2f} ({v['change_pct']:+.2f}%)"
+        f"- {k}: {v['price']:.2f} ({v.get('change_pct', 0) or 0:+.2f}%)"
         for k, v in indicators.items() if v.get('price') is not None
-    ])
+    ]) or "(시세 수집 실패)"
 
     domestic_flat = []
     for arr in domestic_news.values():
         domestic_flat.extend(arr)
 
-    prompt = f"""
-당신은 25년 경력의 증권사 채권/외환 데스크 시니어 애널리스트입니다.
+    prompt = f"""당신은 25년 경력의 증권사 채권/외환 데스크 시니어 애널리스트입니다.
 오늘({TODAY_STR}) 아침, 자산운용 PB들에게 배포할 **투자 상담용 시황 카드뉴스**를 작성합니다.
 
 ## 📊 오늘의 시장 지표
@@ -252,7 +273,7 @@ def generate_ai_briefing(global_news, domestic_news, indicators):
 {fmt(domestic_flat)}
 
 ---
-아래 JSON 형식으로 **정확히** 출력하세요. (markdown 코드블럭 없이 raw JSON만):
+**반드시 아래 JSON 스키마로만, 다른 텍스트 없이 출력하세요. markdown 코드블록 금지.**
 
 {{
   "headline": "오늘 시장을 한 줄로 요약 (25자 이내, 강한 임팩트)",
@@ -261,32 +282,54 @@ def generate_ai_briefing(global_news, domestic_news, indicators):
     {{"icon": "💰", "title": "채권시장", "content": "국내외 금리 동향과 채권시장 핵심 포인트 (2문장)"}},
     {{"icon": "💱", "title": "외환시장", "content": "원/달러, 달러지수, 주요 통화 동향 (2문장)"}},
     {{"icon": "🌐", "title": "글로벌 이슈", "content": "Fed/ECB/지정학 등 매크로 이슈 (2문장)"}},
-    {{"icon": "📈", "title": "주식시장", "content": "美/韓 증시 동향 및 섹터 포인트 (2문장)"}}
+    {{"icon": "📈", "title": "주식시장", "content": "미국·한국 증시 동향 및 섹터 포인트 (2문장)"}}
   ],
   "action_points": [
     "투자자가 오늘 주목해야 할 구체적 액션 포인트 1",
     "투자자가 오늘 주목해야 할 구체적 액션 포인트 2",
     "투자자가 오늘 주목해야 할 구체적 액션 포인트 3"
   ],
-  "watch_today": "오늘 한국시간 기준으로 발표될 주요 경제지표/이벤트 (없으면 '특이 일정 없음')"
+  "watch_today": "오늘 한국시간 기준 발표 예정인 주요 경제지표/이벤트 (없으면 '특이 일정 없음')"
 }}
 """
-    try:
-        resp = model.generate_content(prompt)
-        text = resp.text.strip()
-        # markdown 코드블록 제거
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip()
-        briefing = json.loads(text)
-        print("  ✅ AI 브리핑 생성 완료")
-        return briefing
-    except Exception as e:
-        print(f"  ❌ Gemini 분석 실패: {e}")
-        return None
 
+    # ✅ JSON 응답 강제 (지원 모델에서)
+    generation_config = {
+        "temperature": 0.4,
+        "response_mime_type": "application/json",
+    }
+
+    last_err = None
+    for model_name in model_candidates:
+        try:
+            print(f"  → 모델 시도: {model_name}")
+            model = genai.GenerativeModel(model_name, generation_config=generation_config)
+            resp = model.generate_content(prompt)
+            text = (resp.text or "").strip()
+
+            # 혹시 모를 markdown 코드블록 제거
+            if text.startswith("```"):
+                text = text.strip("`")
+                if text.lower().startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+
+            # 첫 { 부터 마지막 } 까지만 추출 (가장 안전한 파싱)
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1:
+                text = text[start:end + 1]
+
+            briefing = json.loads(text)
+            print(f"  ✅ AI 브리핑 생성 완료 (모델: {model_name})")
+            return briefing
+        except Exception as e:
+            last_err = e
+            print(f"  ⚠️ {model_name} 실패: {e}")
+            continue
+
+    print(f"  ❌ 모든 Gemini 모델 실패. 마지막 오류: {last_err}")
+    return None
 
 # =========================================================
 # 5. 🎨 HTML 카드뉴스 렌더링
@@ -490,7 +533,7 @@ if __name__ == "__main__":
         "korea_economy":   "한국은행 기준금리 물가",
         "korea_market":    "코스피 코스닥 증시 마감",
     }
-    domestic_news = fetch_naver_news(domestic_queries, per_query=3)
+    domestic_news = fetch_domestic_news(domestic_queries, per_query=4)
 
     # 2) 해외 뉴스 (다중 소스 + DeepL 번역)
     global_news = []
