@@ -12,6 +12,7 @@ import requests
 from bs4 import BeautifulSoup
 import deepl
 import google.generativeai as genai
+import re
 
 
 # =========================================================
@@ -183,45 +184,146 @@ def _translate_article(translator, title, desc, link, press):
 
 
 # =========================================================
-# 3. 📈 시장 지표 - Yahoo Finance Quote API (무료, 키 불필요)
+# 3. 📈 시장 지표 - 네이버 증권 (Yahoo Finance 대체)
 # =========================================================
 def fetch_market_indicators():
     """
-    주요 지수 / 환율 / 국채금리 / 원자재 실시간 시세
+    네이버 증권 4개 소스 통합:
+      ① polling API → 국내 지수 (KOSPI/KOSDAQ/KPI200)
+      ② api.stock.naver.com → 환율 / 금속
+      ③ finance.naver.com/world → 해외 주요 지수 (HTML)
     """
-    print("📈 [STEP 3] 글로벌 시장 지표 수집 중...")
-    symbols = {
-        "S&P 500":      "^GSPC",
-        "NASDAQ":       "^IXIC",
-        "KOSPI":        "^KS11",
-        "KOSDAQ":       "^KQ11",
-        "USD/KRW":      "KRW=X",
-        "USD/JPY":      "JPY=X",
-        "DXY (달러지수)": "DX-Y.NYB",
-        "US 10Y 국채":  "^TNX",
-        "US 2Y 국채":   "^IRX",
-        "WTI 원유":     "CL=F",
-        "금(Gold)":     "GC=F",
-        "BTC/USD":      "BTC-USD",
-    }
-    base = "https://query1.finance.yahoo.com/v7/finance/quote?symbols="
+    print("📈 [STEP 3] 네이버 증권 시장 지표 수집 중...")
     indicators = {}
-    try:
-        url = base + ",".join(symbols.values())
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        data = r.json().get("quoteResponse", {}).get("result", [])
-        sym_to_name = {v: k for k, v in symbols.items()}
-        for q in data:
-            name = sym_to_name.get(q.get("symbol"), q.get("symbol"))
-            indicators[name] = {
-                "price": q.get("regularMarketPrice"),
-                "change": q.get("regularMarketChange"),
-                "change_pct": q.get("regularMarketChangePercent"),
-            }
-    except Exception as e:
-        print(f"  ❌ 시세 수집 실패: {e}")
-    return indicators
 
+    headers = {
+        "User-Agent": HEADERS["User-Agent"],
+        "Referer": "https://finance.naver.com/",
+        "Accept": "application/json, text/plain, */*",
+    }
+
+    # -------------------------------------------------
+    # ① 국내 지수 (polling API)
+    # -------------------------------------------------
+    try:
+        url = ("https://polling.finance.naver.com/api/realtime"
+               "?query=SERVICE_INDEX:KOSPI,KOSDAQ,KPI200")
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        name_map = {"KOSPI": "KOSPI", "KOSDAQ": "KOSDAQ", "KPI200": "KOSPI200"}
+        # rf=2/3 상승, rf=4/5 하락
+        for row in data["result"]["areas"][0]["datas"]:
+            code = row["cd"]
+            # 가격 단위 보정: KOSPI/KPI200은 100배, KOSDAQ도 100배 (cv도 동일)
+            price = row["nv"] / 100
+            change = row["cv"] / 100
+            change_pct = row["cr"]
+            sign = 1 if row["rf"] in ("1", "2", "3") else -1
+            indicators[name_map.get(code, code)] = {
+                "price": price,
+                "change": change * sign,
+                "change_pct": change_pct * sign,
+            }
+        print(f"  ✅ 국내 지수 {len([k for k in indicators if k in name_map.values()])}개")
+    except Exception as e:
+        print(f"  ❌ 국내 지수 수집 실패: {e}")
+
+    # -------------------------------------------------
+    # ② 환율 (api.stock.naver.com)
+    # -------------------------------------------------
+    fx_targets = {
+        "원/달러 (USD/KRW)": "FX_USDKRW",
+        "원/엔 100 (JPY/KRW)": "FX_JPYKRW",
+        "원/유로 (EUR/KRW)": "FX_EURKRW",
+        "원/위안 (CNY/KRW)": "FX_CNYKRW",
+    }
+    for name, code in fx_targets.items():
+        try:
+            url = f"https://api.stock.naver.com/marketindex/exchange/{code}"
+            r = requests.get(url, headers=headers, timeout=10)
+            d = r.json().get("exchangeInfo", {})
+            sign = -1 if d.get("fluctuationsType", {}).get("code") in ("4", "5") else 1
+            indicators[name] = {
+                "price": float(d["closePrice"].replace(",", "")),
+                "change": float(d["fluctuations"].replace(",", "")) * sign,
+                "change_pct": float(d["fluctuationsRatio"]) * sign,
+            }
+        except Exception as e:
+            print(f"  ⚠️ 환율 [{name}] 실패: {e}")
+        time.sleep(0.2)
+    print(f"  ✅ 환율 수집 완료")
+
+    # -------------------------------------------------
+    # ③ 금 시세 (api.stock.naver.com)
+    # -------------------------------------------------
+    try:
+        url = "https://api.stock.naver.com/marketindex/metals/M04020000"
+        r = requests.get(url, headers=headers, timeout=10)
+        d = r.json()
+        sign = -1 if d.get("fluctuationsType", {}).get("code") in ("4", "5") else 1
+        indicators["국내 금 (원/g)"] = {
+            "price": float(d["closePrice"].replace(",", "")),
+            "change": float(d["fluctuations"].replace(",", "")) * sign,
+            "change_pct": float(d["fluctuationsRatio"]) * sign,
+        }
+        print(f"  ✅ 금 시세 수집")
+    except Exception as e:
+        print(f"  ⚠️ 금 시세 실패: {e}")
+
+    # -------------------------------------------------
+    # ④ 해외 주요 지수 (HTML 파싱)
+    # -------------------------------------------------
+    world_targets = {
+        "다우존스 (DJI)":   "DJI@DJI",
+        "S&P 500":         "SPI@SPX",
+        "NASDAQ":          "NAS@IXIC",
+        "닛케이 225":       "NII@NI225",
+        "상해종합":         "SHS@000001",
+        "홍콩H (HSI)":     "HSI@HSI",
+    }
+    for name, sym in world_targets.items():
+        try:
+            url = f"https://finance.naver.com/world/sise.naver?symbol={sym}"
+            r = requests.get(url, headers=headers, timeout=10)
+            r.encoding = 'euc-kr'  # 네이버 world 페이지는 euc-kr
+            html = r.text
+            soup = BeautifulSoup(html, 'html.parser')
+
+            # 현재가: <p class="no_today"> 내부의 숫자 spans 또는 큰 글씨 영역
+            # 정규식으로 가장 확실하게: 현재가는 첫 큰 숫자 (천단위 콤마 포함)
+            # HTML 예: "51,666.84\n전일대비 45.87  ( -0.09% )"
+            price_match = re.search(
+                r'<em[^>]*>([0-9,]+\.\d+)</em>\s*</td>',
+                html
+            )
+            # 더 단순하게 - 본문 텍스트에서 추출
+            text = soup.get_text(" ", strip=True)
+            # "현재가 51,666.84 전일대비 45.87 ( -0.09% )" 패턴
+            m = re.search(
+                r'([0-9,]+\.\d{1,2})\s*전일대비\s*([0-9,]+\.\d{1,2})\s*\(\s*([-+]?\d+\.\d+)\s*%\s*\)',
+                text
+            )
+            if m:
+                price = float(m.group(1).replace(",", ""))
+                change = float(m.group(2).replace(",", ""))
+                pct = float(m.group(3))
+                # 부호 보정: 본문에 '하락' 단어가 있으면 음수, 그렇지 않으면 pct 기호로 판별
+                if pct < 0 and change > 0:
+                    change = -change
+                indicators[name] = {
+                    "price": price,
+                    "change": change,
+                    "change_pct": pct,
+                }
+            else:
+                print(f"  ⚠️ 해외 지수 [{name}] 정규식 매치 실패")
+        except Exception as e:
+            print(f"  ⚠️ 해외 지수 [{name}] 실패: {e}")
+        time.sleep(0.3)
+    print(f"  ✅ 해외 지수 수집 완료")
+
+    print(f"📊 총 {len(indicators)}개 지표 수집됨")
+    return indicators
 
 # =========================================================
 # 4. 🤖 Gemini AI - 핵심 시황 요약 + 카드뉴스 생성 (안정화 버전)
